@@ -199,7 +199,6 @@ jobs:
       REPO: ${{ github.repository }}
       RUN_URL: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}
       CLAUDE_FAILED: ${{ needs.warm-claude.result == 'failure' }}
-      CODEX_FAILED: ${{ needs.warm-codex.result == 'failure' }}
     steps:
       - name: Open or update failure issue
         if: env.CLAUDE_FAILED == 'true' || env.CODEX_FAILED == 'true'
