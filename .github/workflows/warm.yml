@@ -189,7 +189,7 @@ jobs:
   # anyone polling Actions. Once things succeed again, auto-close it.
   # --------------------------------------------------------------------------
   notify:
-    needs: [warm-claude, warm-codex]
+    needs: [warm-claude]
     if: ${{ always() }}
     runs-on: ubuntu-latest
     permissions:
@@ -255,7 +255,7 @@ jobs:
   # commits at most once per calendar day.
   # --------------------------------------------------------------------------
   heartbeat:
-    needs: [warm-claude, warm-codex]
+    needs: [warm-claude]
     if: ${{ always() }}
     runs-on: ubuntu-latest
     permissions:
