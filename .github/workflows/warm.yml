@@ -1,208 +1,61 @@
 name: warm-usage-windows
 
-# Keeps the rolling 5-hour usage windows for Claude Code (Pro/Max subscription)
-# and Codex (ChatGPT subscription) CONTINUOUSLY warm by re-sending one throwaway
-# prompt every ~5 hours, around the clock.
+# Sends one "hello" to Claude Haiku 4.5 every time this workflow is triggered.
+# No gating: every run sends.
 #
-# Why continuous, not once-a-day: the 5h window starts on the first message and
-# EXPIRES 5h later. A single morning warm-up is useless if you sit down more
-# than 5h after it fired — the window is already dead and your first real
-# message starts a fresh one anyway (this happened; see commit history).
-# Chaining a tiny "hi" right after each window expires means a window is
-# already active whenever you actually start working, at a cost of ~5 trivial
-# messages per provider per day.
+# Schedule lives in the Cloudflare Worker (not GitHub cron, which is unreliable):
+#   every 5h starting 2026-10-14 12:51 Asia/Ho_Chi_Minh (05:51 UTC)
+#   -> 12:51, 17:51, 22:51, 03:51, 08:51, 13:51, ...
+# The Worker triggers this workflow via the workflow_dispatch API.
 #
-# Auth: subscription OAuth tokens only, NO API keys.
-#   - Claude: CLAUDE_CODE_OAUTH_TOKEN  (from `claude setup-token`)
-#   - Codex:  CODEX_AUTH_JSON          (contents of ~/.codex/auth.json after `codex login`)
+# Manual "Run workflow" also sends, for testing. It does NOT shift the
+# schedule, because the schedule is fixed in the Worker, not derived from the
+# last run.
 #
-# Scheduling mechanics:
-#   - Cron fires every 30 min all day. Each job first asks the ACCOUNT'S OWN
-#     usage meter (the same API the apps read) whether a 5h window is already
-#     running: if yes, skip; if cold, send. This respects windows the user
-#     started themselves, which no local bookkeeping can know about.
-#   - Fallback: if the usage endpoint is unreachable or changes shape, the
-#     job falls back to the committed per-provider epoch-seconds state file
-#     and only sends once the last warm is more than 5h01m old. The state
-#     file is also kept as an audit trail of every real send.
-#     (Sending while a window is active is worse than useless: the message
-#     lands inside the still-active window and does NOT start a new one.)
-#   - GitHub cron is best-effort and often late on low-traffic repos; with an
-#     elapsed-time gate that's harmless — the first run that lands after
-#     expiry re-warms, and the chain self-corrects.
-#   - Manual `workflow_dispatch` always sends for real (bypasses the gate)
-#     and updates the state file.
-#   - Scheduled workflows run ONLY on the default branch.
-#
-# Resilience:
-#   - CLI versions are pinned (see env below) so an upstream release can't
-#     silently break a flag this workflow depends on. Bump deliberately.
-#   - The warm-up call itself retries up to 3x with a short backoff, so a
-#     transient network/API blip doesn't count as a real failure or wake
-#     anyone up for nothing.
-#   - If a job still fails after retries (e.g. a subscription token was
-#     genuinely revoked), the `notify` job opens a single GitHub issue with
-#     the exact recovery commands. GitHub emails repo owners on new issues
-#     by default, so you find out without watching the Actions tab. Once a
-#     later run succeeds again, that issue is auto-closed.
+# Auth: CLAUDE_CODE_OAUTH_TOKEN secret (from `claude setup-token`).
 
 on:
-  schedule:
-    # Every 30 min, 24/7 — the elapsed-time gate limits real sends to ~5/day.
-    # Offset from :00/:30 on purpose: those are GitHub's most congested cron
-    # minutes and jobs scheduled there get delayed/skipped the most.
-    - cron: "7,37 * * * *"
   workflow_dispatch:
-    # Manual button: force defaults to true (always sends).
-    # External cron (Cloudflare Worker) passes force=false so the run goes
-    # through the same window check as a scheduled run.
-    inputs:
-      force:
-        description: "Send even if a 5h window is already active"
-        type: boolean
-        default: true
 
-# Never run two warm-ups at once (manual + scheduled + external cron).
+# Never run two warm-ups at once.
 concurrency:
   group: warm
   cancel-in-progress: false
 
-# Least privilege by default; jobs that need more elevate individually.
 permissions:
   contents: read
 
 env:
-  # Fallback-gate minimum seconds between real warms: 5h + 1min safety margin,
-  # so a send can never land inside the previous still-active window (which
-  # would be wasted and would NOT start a new window). Only used when the live
-  # usage meter is unreachable.
-  WARM_INTERVAL_SECONDS: "18060"
-  # Safety floor: if the live meter claims "cold" less than this many seconds
-  # after our own last send, distrust it and skip. A real window lasts 5h, so
-  # this can never block a legitimate re-warm; it only stops a broken meter
-  # (or a model that doesn't register on it) from causing a send every 30 min.
-  MIN_REWARM_SECONDS: "3600"
-  # Pinned CLI versions - last verified working. Bump intentionally, not
-  # silently via an unpinned `npm install -g <pkg>@latest`.
-  CLAUDE_CLI_VERSION: "2.1.205"
-  CODEX_CLI_VERSION: "0.144.1"   # gpt-5.6-sol needs >= 0.144
+  CLAUDE_CLI_VERSION: "2.1.205"   # pinned; bump deliberately
+  MODEL: "claude-haiku-4-5-20251001"
 
 jobs:
-  # --------------------------------------------------------------------------
-  # Claude Code — uses your Pro/Max subscription via OAuth token. Solid path.
-  # --------------------------------------------------------------------------
   warm-claude:
     runs-on: ubuntu-latest
-    permissions:
-      contents: write
     steps:
-      - uses: actions/checkout@v4
-
-      - name: Check if a window is already running
-        id: check
-        env:
-          CLAUDE_CODE_OAUTH_TOKEN: ${{ secrets.CLAUDE_CODE_OAUTH_TOKEN }}
-        run: |
-          send=""
-          if [ "${{ github.event_name }}" = "workflow_dispatch" ] && [ "${{ inputs.force }}" = "true" ]; then
-            echo "Forced run - sending regardless of window state."
-            send=true
-          fi
-
-          now=$(date +%s)
-          last=$(cat .state/claude-last-warm.txt 2>/dev/null || echo 0)
-          # Legacy state files stored a YYYY-MM-DD date; treat anything
-          # non-numeric as "never warmed".
-          case "$last" in (''|*[!0-9]*) last=0 ;; esac
-          elapsed=$(( now - last ))
-
-          # Primary gate: the account's real usage meter. It knows about
-          # windows started from ANY device, not just our own sends.
-          if [ -z "$send" ]; then
-            usage=$(curl -sf --max-time 30 https://api.anthropic.com/api/oauth/usage \
-              -H "Authorization: Bearer $CLAUDE_CODE_OAUTH_TOKEN" \
-              -H "anthropic-beta: oauth-2025-04-20" || true)
-            if printf '%s' "$usage" | jq -e '.five_hour' >/dev/null 2>&1; then
-              resets_at=$(printf '%s' "$usage" | jq -r '.five_hour.resets_at // empty')
-              case "$resets_at" in
-                ('') reset_epoch=0 ;;
-                (*[!0-9]*) reset_epoch=$(date -u -d "$resets_at" +%s 2>/dev/null || echo 0) ;;
-                (*) reset_epoch=$resets_at ;;
-              esac
-              if [ "$reset_epoch" -gt "$now" ]; then
-                echo "Live meter: window active until $resets_at - skipping."
-                send=false
-              elif [ "$elapsed" -lt "$MIN_REWARM_SECONDS" ]; then
-                echo "Live meter says cold but we sent ${elapsed}s ago - skipping (safety floor)."
-                send=false
-              else
-                echo "Live meter: no active window - warming."
-                send=true
-              fi
-            else
-              echo "Live meter unavailable - falling back to state file."
-            fi
-          fi
-
-          # Fallback gate: our own last-send timestamp.
-          if [ -z "$send" ]; then
-            if [ "$elapsed" -lt "$WARM_INTERVAL_SECONDS" ]; then
-              echo "State file: warmed ${elapsed}s ago (< ${WARM_INTERVAL_SECONDS}s) - skipping."
-              send=false
-            else
-              echo "State file: last warm ${elapsed}s ago - warming."
-              send=true
-            fi
-          fi
-          echo "send=$send" >> "$GITHUB_OUTPUT"
-
       - uses: actions/setup-node@v4
-        if: steps.check.outputs.send == 'true'
         with:
           node-version: "20"
 
       - name: Install Claude Code CLI
-        if: steps.check.outputs.send == 'true'
         run: npm install -g "@anthropic-ai/claude-code@${CLAUDE_CLI_VERSION}"
 
-      - name: Send warm-up prompt
-        if: steps.check.outputs.send == 'true'
+      - name: Send hello
         env:
           CLAUDE_CODE_OAUTH_TOKEN: ${{ secrets.CLAUDE_CODE_OAUTH_TOKEN }}
         run: |
+          echo "Sending at $(TZ='Asia/Ho_Chi_Minh' date '+%F %H:%M %Z')"
           for i in 1 2 3; do
-            claude -p "hi" --model claude-haiku-4-5-20251001 && exit 0
+            claude -p "hello" --model "$MODEL" && exit 0
             echo "Attempt $i failed, retrying in 10s..."
             sleep 10
           done
           echo "All 3 attempts failed."
           exit 1
 
-      - name: Record warm timestamp
-        if: steps.check.outputs.send == 'true'
-        run: |
-          mkdir -p .state
-          date +%s > .state/claude-last-warm.txt
-          git config user.name  "github-actions[bot]"
-          git config user.email "github-actions[bot]@users.noreply.github.com"
-          git add .state/claude-last-warm.txt
-          git commit -m "chore: warm claude $(TZ='Asia/Ho_Chi_Minh' date '+%F %H:%M %Z')" || exit 0
-          for i in 1 2 3; do
-            git pull --rebase --autostash && git push && exit 0
-            sleep $((RANDOM % 5 + 1))
-          done
-          echo "Push failed after 3 attempts"
-          exit 1
-
-  
-
-  # --------------------------------------------------------------------------
-  # Notify — the only time you should ever need to look at this repo. If a
-  # warm job fails (all 3 retries exhausted - a real auth/CLI problem, not a
-  # blip), open one GitHub issue with the exact fix. GitHub emails repo
-  # owners on new issues/comments by default, so this reaches you without
-  # anyone polling Actions. Once things succeed again, auto-close it.
-  # --------------------------------------------------------------------------
+  # If the send fails after retries (e.g. token revoked), open a GitHub issue
+  # (GitHub emails you). Auto-closes on the next successful run.
+  # Requires Issues to be enabled in repo Settings -> General -> Features.
   notify:
     needs: [warm-claude]
     if: ${{ always() }}
@@ -214,74 +67,32 @@ jobs:
       REPO: ${{ github.repository }}
       RUN_URL: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}
       CLAUDE_FAILED: ${{ needs.warm-claude.result == 'failure' }}
+      TITLE: "Warm-up needs attention"
     steps:
       - name: Open or update failure issue
         if: env.CLAUDE_FAILED == 'true'
         run: |
-          title="Warm-up needs attention"
           existing=$(gh issue list --repo "$REPO" --state open --json number,title \
-            --jq '[.[] | select(.title=="'"$title"'")][0].number // empty')
-
-          body="Automated warm-up failed after 3 retries. Failed run: $RUN_URL"$'\n\n'
-
-          if [ "$CLAUDE_FAILED" = "true" ]; then
-            body+="### Claude"$'\n'
-            body+='Likely an expired/revoked OAuth token. Fix (run in your own terminal):'$'\n'
-            body+='```bash'$'\n'
-            body+='claude setup-token'$'\n'
-            body+="gh secret set CLAUDE_CODE_OAUTH_TOKEN --repo $REPO"$'\n'
-            body+='```'$'\n\n'
-          fi
-
+            --jq '[.[] | select(.title==env.TITLE)][0].number // empty')
+          body="Warm-up failed after 3 retries. Failed run: $RUN_URL"$'\n\n'
+          body+='Likely an expired/revoked OAuth token. Fix (run in your own terminal):'$'\n'
+          body+='```bash'$'\n'
+          body+='claude setup-token'$'\n'
+          body+="gh secret set CLAUDE_CODE_OAUTH_TOKEN --repo $REPO"$'\n'
+          body+='```'$'\n\n'
           body+="This issue will auto-close the next time the warm-up succeeds."
-
           if [ -n "$existing" ]; then
             gh issue comment "$existing" --repo "$REPO" --body "$body"
           else
-            gh issue create --repo "$REPO" --title "$title" --body "$body"
+            gh issue create --repo "$REPO" --title "$TITLE" --body "$body"
           fi
 
       - name: Close resolved failure issue
         if: env.CLAUDE_FAILED == 'false'
         run: |
-          title="Warm-up needs attention"
           existing=$(gh issue list --repo "$REPO" --state open --json number,title \
-            --jq '[.[] | select(.title=="'"$title"'")][0].number // empty')
+            --jq '[.[] | select(.title==env.TITLE)][0].number // empty')
           if [ -n "$existing" ]; then
             gh issue close "$existing" --repo "$REPO" \
               --comment "Resolved - a subsequent run succeeded. Closing automatically."
           fi
-
-  # --------------------------------------------------------------------------
-  # Heartbeat — keeps the repo "active" so GitHub never auto-disables the
-  # schedule after 60 idle days, even if both warm jobs are failing.
-  # Committing on every trigger would be 48 commits/day of noise, so it
-  # commits at most once per calendar day.
-  # --------------------------------------------------------------------------
-  heartbeat:
-    needs: [warm-claude]
-    if: ${{ always() }}
-    runs-on: ubuntu-latest
-    permissions:
-      contents: write
-    steps:
-      - uses: actions/checkout@v4
-
-      - name: Commit timestamp (once per day)
-        run: |
-          today=$(date -u +%F)
-          if [ "$(cut -c1-10 heartbeat.txt 2>/dev/null)" = "$today" ]; then
-            echo "Heartbeat already committed today ($today) - skipping."
-            exit 0
-          fi
-          date -u +"%Y-%m-%dT%H:%M:%SZ" > heartbeat.txt
-          git config user.name  "github-actions[bot]"
-          git config user.email "github-actions[bot]@users.noreply.github.com"
-          git add heartbeat.txt
-          git commit -m "chore: heartbeat $(cat heartbeat.txt)" || exit 0
-          for i in 1 2 3; do
-            git pull --rebase --autostash && git push && exit 0
-            sleep $((RANDOM % 5 + 1))
-          done
-          echo "Push failed after 3 attempts"
-          exit 1
