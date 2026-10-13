@@ -52,7 +52,20 @@ on:
     # Offset from :00/:30 on purpose: those are GitHub's most congested cron
     # minutes and jobs scheduled there get delayed/skipped the most.
     - cron: "7,37 * * * *"
-  workflow_dispatch:           # manual "Run workflow" button - always sends for real
+  workflow_dispatch:
+    # Manual button: force defaults to true (always sends).
+    # External cron (Cloudflare Worker) passes force=false so the run goes
+    # through the same window check as a scheduled run.
+    inputs:
+      force:
+        description: "Send even if a 5h window is already active"
+        type: boolean
+        default: true
+
+# Never run two warm-ups at once (manual + scheduled + external cron).
+concurrency:
+  group: warm
+  cancel-in-progress: false
 
 # Least privilege by default; jobs that need more elevate individually.
 permissions:
@@ -91,8 +104,8 @@ jobs:
           CLAUDE_CODE_OAUTH_TOKEN: ${{ secrets.CLAUDE_CODE_OAUTH_TOKEN }}
         run: |
           send=""
-          if [ "${{ github.event_name }}" = "workflow_dispatch" ]; then
-            echo "Manual run - sending regardless of window state."
+          if [ "${{ github.event_name }}" = "workflow_dispatch" ] && [ "${{ inputs.force }}" = "true" ]; then
+            echo "Forced run - sending regardless of window state."
             send=true
           fi
 
@@ -173,11 +186,13 @@ jobs:
           git config user.name  "github-actions[bot]"
           git config user.email "github-actions[bot]@users.noreply.github.com"
           git add .state/claude-last-warm.txt
-          git commit -m "chore: warm claude $(TZ='America/Chicago' date '+%F %H:%M %Z')" || exit 0
+          git commit -m "chore: warm claude $(TZ='Asia/Ho_Chi_Minh' date '+%F %H:%M %Z')" || exit 0
           for i in 1 2 3; do
-            git pull --rebase --autostash && git push && break
+            git pull --rebase --autostash && git push && exit 0
             sleep $((RANDOM % 5 + 1))
           done
+          echo "Push failed after 3 attempts"
+          exit 1
 
   
 
@@ -201,7 +216,7 @@ jobs:
       CLAUDE_FAILED: ${{ needs.warm-claude.result == 'failure' }}
     steps:
       - name: Open or update failure issue
-        if: env.CLAUDE_FAILED == 'true' || env.CODEX_FAILED == 'true'
+        if: env.CLAUDE_FAILED == 'true'
         run: |
           title="Warm-up needs attention"
           existing=$(gh issue list --repo "$REPO" --state open --json number,title \
@@ -218,17 +233,7 @@ jobs:
             body+='```'$'\n\n'
           fi
 
-          if [ "$CODEX_FAILED" = "true" ]; then
-            body+="### Codex"$'\n'
-            body+='Refresh token is dead (OpenAI has no long-lived CI credential). Fix (run in your own terminal):'$'\n'
-            body+='```bash'$'\n'
-            body+='codex login'$'\n'
-            body+="gh secret set CODEX_AUTH_JSON --repo $REPO < ~/.codex/auth.json"$'\n'
-            body+='```'$'\n\n'
-            body+='**Do NOT run `codex login` again afterwards.** OpenAI issues one refresh-token family per account, so a second login revokes the token you just uploaded and CI fails with `token_revoked`. Upload the auth.json from your most recent login, then leave it alone.'$'\n\n'
-          fi
-
-          body+="This issue will auto-close the next time both jobs succeed."
+          body+="This issue will auto-close the next time the warm-up succeeds."
 
           if [ -n "$existing" ]; then
             gh issue comment "$existing" --repo "$REPO" --body "$body"
@@ -237,7 +242,7 @@ jobs:
           fi
 
       - name: Close resolved failure issue
-        if: env.CLAUDE_FAILED == 'false' && env.CODEX_FAILED == 'false'
+        if: env.CLAUDE_FAILED == 'false'
         run: |
           title="Warm-up needs attention"
           existing=$(gh issue list --repo "$REPO" --state open --json number,title \
@@ -275,6 +280,8 @@ jobs:
           git add heartbeat.txt
           git commit -m "chore: heartbeat $(cat heartbeat.txt)" || exit 0
           for i in 1 2 3; do
-            git pull --rebase --autostash && git push && break
+            git pull --rebase --autostash && git push && exit 0
             sleep $((RANDOM % 5 + 1))
           done
+          echo "Push failed after 3 attempts"
+          exit 1
